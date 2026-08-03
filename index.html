@@ -102,7 +102,7 @@
 <body>
   <div class="code-card">
     <div class="code-header">
-      <span class="code-title">RadixCache.cs</span>
+      <span class="code-title">RadixTrie.cs</span>
       <button class="copy-btn" id="copyBtn" type="button">
         <svg viewBox="0 0 16 16" aria-hidden="true">
           <path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25v-7.5Z"/>
@@ -113,380 +113,427 @@
     </div>
     <pre><code id="codeBlock">
       
-      
-      
-      using System;
+  using System;
 using System.Collections.Generic;
-using System.Threading;
-using System.Threading.Tasks;
 
 namespace isandburn.collections;
 
 /// <summary>
-/// A thread-safe, size-bounded prefix cache built on top of
-/// <see cref="RadixTrie{TValue}"/>. Combines the trie's O(L) prefix queries
-/// with the policy a cache manager needs: LRU + size-based eviction, optional
-/// TTL, snapshot enumeration, and a check-then-act async fetch path.
+/// A compact prefix tree (radix trie) mapping string keys to optional values,
+/// keyed by their shared prefixes.
 /// </summary>
-/// <typeparam name="TValue">The type of value associated with each cached key.</typeparam>
+/// <typeparam name="TValue">The type of value associated with each stored key.</typeparam>
 /// <remarks>
-/// <para>
-/// <b>Thread safety.</b> All public operations are guarded by a single private
-/// lock, so concurrent callers (e.g. a UI thread plus background fetch/refresh
-/// work) are safe. The lock is never held across an <c>await</c>: the slow
-/// cache-miss fetch runs outside the lock (see <see cref="GetOrAddAsync"/>),
-/// so a fetch never blocks other callers.
-/// </para>
-/// <para>
-/// <b>Eviction.</b> When the cache exceeds <see cref="Capacity"/>, the
-/// least-recently-used entry is evicted. Entries with a TTL are also removed
-/// lazily on access and by <see cref="TrimExpired"/>.
-/// </para>
-/// <para>
-/// <b>Empty keys.</b> Consistent with the underlying trie, inserting an empty
-/// string key is a no-op and is never stored.
-/// </para>
+/// This implementation is <b>not thread-safe</b>. Concurrent calls to
+/// <see cref="Insert"/>, <see cref="Delete"/>, or even overlapping
+/// <see cref="SearchByPrefix"/> enumerations against a shared instance may
+/// corrupt the internal dictionaries. Callers that need concurrent access
+/// must synchronize externally (e.g. with a lock).
 /// </remarks>
-public class RadixCache<TValue>
+public class RadixTrie<TValue>
 {
-    private sealed class CacheEntry
+    private class Node
     {
-        public DateTime LastAccess;
-        public DateTime? ExpiresAt;
+        public string EdgeLabel { get; set; }
+        public Dictionary<char, Node> Children { get; } = new Dictionary<char, Node>();
+        // A node "has a value" when it marks the end of a stored key. The value
+        // may be null even for a present key (e.g. TValue is a reference type
+        // and the caller stored null), so presence is tracked separately from
+        // the value itself via HasValue.
+        public TValue? Value { get; set; }
+        public bool HasValue { get; set; }
+
+        public Node(string edgeLabel)
+        {
+            EdgeLabel = edgeLabel;
+        }
     }
 
-    private readonly object _gate = new();
-    private RadixTrie<TValue> _trie = new();
-    private readonly Dictionary<string, CacheEntry> _entries = new();
-    private readonly int _capacity;
-    private readonly TimeSpan? _defaultTtl;
-    private readonly Func<DateTime> _clock;
+    private readonly Node _root = new Node(string.Empty);
 
     /// <summary>
-    /// Gets the maximum number of entries the cache will hold before evicting
-    /// the least-recently-used entry.
+    /// Gets the number of keys currently stored in the trie.
     /// </summary>
-    public int Capacity => _capacity;
+    public int Count { get; private set; }
 
     /// <summary>
-    /// Gets the number of entries currently stored in the cache.
+    /// Inserts or updates the value associated with <paramref name="key"/>.
+    /// If the key already exists, its value is replaced.
     /// </summary>
-    public int Count
+    /// <exception cref="ArgumentNullException"><paramref name="key"/> is null.</exception>
+    public void Insert(string key, TValue? value)
     {
-        get
+        ArgumentNullException.ThrowIfNull(key);
+        if (key.Length == 0) return;
+
+        Node node = _root;
+        int pos = 0;
+        while (true)
         {
-            lock (_gate)
+            // Consumed the entire key exactly at this node boundary.
+            if (pos == key.Length)
             {
-                return _entries.Count;
+                if (!node.HasValue) Count++;
+                node.Value = value;
+                node.HasValue = true;
+                return;
+            }
+
+            char c = key[pos];
+            if (!node.Children.TryGetValue(c, out Node? child))
+            {
+                // No matching edge: create a fresh leaf holding the rest of the key.
+                var leaf = new Node(key.Substring(pos))
+                {
+                    Value = value,
+                    HasValue = true
+                };
+                node.Children.Add(c, leaf);
+                Count++;
+                return;
+            }
+
+            ReadOnlySpan<char> edge = child.EdgeLabel.AsSpan();
+            ReadOnlySpan<char> remaining = key.AsSpan(pos);
+            int i = CommonPrefixLength(edge, remaining);
+
+            if (i == edge.Length)
+            {
+                // Edge fully matched: descend and keep consuming the key.
+                node = child;
+                pos += i;
+            }
+            else
+            {
+                // Edge mismatch mid-label: split the existing edge.
+                string commonPrefix = child.EdgeLabel.Substring(0, i);
+                string remainingEdge = child.EdgeLabel.Substring(i);
+                int remainingKeyLen = key.Length - pos - i;
+
+                child.EdgeLabel = commonPrefix;
+
+                // Move the old node's value flag and children into a new split
+                // node keyed by the first character of the remaining edge.
+                Node splitNode = new Node(remainingEdge)
+                {
+                    Value = child.Value,
+                    HasValue = child.HasValue
+                };
+                foreach (var grandChild in child.Children)
+                {
+                    splitNode.Children.Add(grandChild.Key, grandChild.Value);
+                }
+
+                child.Children.Clear();
+                child.Children.Add(remainingEdge[0], splitNode);
+
+                // The old node's value/HasValue have been moved to splitNode;
+                // reset child so it represents only the split-point key (if
+                // any) going forward. Without this, the HasValue flag below
+                // would still reflect the old key and the new key's Count
+                // increment would be skipped.
+                child.Value = default;
+                child.HasValue = false;
+
+                if (remainingKeyLen == 0)
+                {
+                    // The new key ends exactly at the split point. It is always
+                    // new here: if it already existed, the edge would already
+                    // be split at this boundary and we would have descended and
+                    // updated in place rather than splitting.
+                    child.Value = value;
+                    child.HasValue = true;
+                    Count++;
+                }
+                else
+                {
+                    // Append the rest of the new key as a new leaf.
+                    string remainingKey = key.Substring(pos + i);
+                    var leaf = new Node(remainingKey)
+                    {
+                        Value = value,
+                        HasValue = true
+                    };
+                    child.Children.Add(remainingKey[0], leaf);
+                    Count++;
+                }
+                return;
             }
         }
     }
 
     /// <summary>
-    /// Initializes a new cache with the given capacity and optional default TTL.
+    /// Removes a key and its associated value from the trie, compacting edges
+    /// back together where possible.
     /// </summary>
-    /// <param name="capacity">The maximum number of entries. Must be &gt; 0.</param>
-    /// <param name="defaultTtl">Optional default time-to-live applied to entries
-    /// inserted without an explicit TTL. <c>null</c> means no expiry.</param>
-    /// <param name="clock">Optional clock source (for testing). Defaults to
-    /// <see cref="DateTime.UtcNow"/>.</param>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="capacity"/> is &lt;= 0.</exception>
-    public RadixCache(int capacity, TimeSpan? defaultTtl = null, Func<DateTime>? clock = null)
-    {
-        if (capacity <= 0) throw new ArgumentOutOfRangeException(nameof(capacity), "Capacity must be greater than zero.");
-        _capacity = capacity;
-        _defaultTtl = defaultTtl;
-        _clock = clock ?? (() => DateTime.UtcNow);
-    }
-
-    /// <summary>
-    /// Inserts or updates the value for <paramref name="key"/>, using the
-    /// cache's default TTL. If the cache is at capacity, the least-recently-used
-    /// entry is evicted.
-    /// </summary>
+    /// <returns><c>true</c> if the key was present and removed; otherwise <c>false</c>.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="key"/> is null.</exception>
-    public void Insert(string key, TValue? value) => Insert(key, value, _defaultTtl);
-
-    /// <summary>
-    /// Inserts or updates the value for <paramref name="key"/> with an explicit
-    /// TTL. If the cache is at capacity, the least-recently-used entry is evicted.
-    /// </summary>
-    /// <exception cref="ArgumentNullException"><paramref name="key"/> is null.</exception>
-    public void Insert(string key, TValue? value, TimeSpan? ttl)
+    public bool Delete(string key)
     {
         ArgumentNullException.ThrowIfNull(key);
-        if (key.Length == 0) return; // consistent with the trie: empty key is a no-op
+        if (key.Length == 0) return false;
 
-        lock (_gate)
+        // Walk down recording the path so we can unwind and compact iteratively.
+        var path = new List<(Node parent, char key, Node child)>();
+        Node node = _root;
+        int pos = 0;
+        while (pos < key.Length)
         {
-            DateTime now = _clock();
-            bool isNew = !_entries.ContainsKey(key);
+            char c = key[pos];
+            if (!node.Children.TryGetValue(c, out Node? child)) return false;
 
-            _trie.Insert(key, value);
-            _entries[key] = new CacheEntry
-            {
-                LastAccess = now,
-                ExpiresAt = ttl.HasValue ? now + ttl.Value : null
-            };
+            ReadOnlySpan<char> edge = child.EdgeLabel.AsSpan();
+            ReadOnlySpan<char> remaining = key.AsSpan(pos);
+            int i = CommonPrefixLength(edge, remaining);
 
-            if (isNew) EvictIfNeeded(now);
+            // Key diverges from the edge before the edge ends -> not present.
+            if (i < edge.Length) return false;
+
+            path.Add((node, c, child));
+            node = child;
+            pos += i;
         }
+
+        if (!node.HasValue) return false;
+        node.Value = default;
+        node.HasValue = false;
+        Count--;
+
+        // Unwind from the leaf upward, pruning dead leaves and merging
+        // single-child chains to keep the trie compact.
+        for (int idx = path.Count - 1; idx >= 0; idx--)
+        {
+            var (parent, keyChar, child) = path[idx];
+
+            if (child.Children.Count == 0 && !child.HasValue)
+            {
+                // Child is now an empty leaf: remove it from its parent.
+                parent.Children.Remove(keyChar);
+            }
+            else if (!child.HasValue && child.Children.Count == 1)
+            {
+                // Child is a pass-through node with a single descendant: merge.
+                Node grandChild = GetSingleChild(child);
+                child.EdgeLabel = child.EdgeLabel + grandChild.EdgeLabel;
+                child.Value = grandChild.Value;
+                child.HasValue = grandChild.HasValue;
+                child.Children.Clear();
+                foreach (var gc in grandChild.Children)
+                {
+                    child.Children.Add(gc.Key, gc.Value);
+                }
+            }
+        }
+        return true;
+    }
+
+    private static Node GetSingleChild(Node node)
+    {
+        foreach (var entry in node.Children)
+        {
+            return entry.Value;
+        }
+        throw new InvalidOperationException("Expected exactly one child.");
     }
 
     /// <summary>
-    /// Attempts to retrieve the value for <paramref name="key"/>. On a hit, the
-    /// entry's last-access time is updated (for LRU). Expired entries are
-    /// removed and treated as misses.
+    /// Returns <c>true</c> if the exact key is present in the trie, and outputs
+    /// its associated value.
     /// </summary>
     /// <exception cref="ArgumentNullException"><paramref name="key"/> is null.</exception>
     public bool TryGet(string key, out TValue? value)
     {
         ArgumentNullException.ThrowIfNull(key);
-        lock (_gate)
+        value = default;
+
+        Node node = _root;
+        int pos = 0;
+        while (true)
         {
-            return TryGetInternal(key, out value);
+            if (pos == key.Length)
+            {
+                if (!node.HasValue) return false;
+                value = node.Value;
+                return true;
+            }
+
+            if (!node.Children.TryGetValue(key[pos], out Node? child)) return false;
+
+            ReadOnlySpan<char> edge = child.EdgeLabel.AsSpan();
+            ReadOnlySpan<char> remaining = key.AsSpan(pos);
+            int i = CommonPrefixLength(edge, remaining);
+
+            // Key diverges from the edge before the edge ends -> not present.
+            if (i < edge.Length) return false;
+
+            // Edge fully matched: descend and keep consuming.
+            node = child;
+            pos += i;
         }
     }
 
     /// <summary>
-    /// Returns <c>true</c> if <paramref name="key"/> is present and not expired.
+    /// Returns <c>true</c> if the exact key is present in the trie.
     /// </summary>
     /// <exception cref="ArgumentNullException"><paramref name="key"/> is null.</exception>
     public bool Contains(string key) => TryGet(key, out _);
 
     /// <summary>
     /// Finds the longest stored key that is a prefix of <paramref name="query"/>
-    /// and returns it with its value. Expired matches are removed and skipped in
-    /// favor of the next-longest non-expired prefix.
+    /// and returns it along with its associated value. This is the structural
+    /// query a prefix cache is built around: given a query string, find the
+    /// longest already-stored entry that the query extends, so the caller can
+    /// reuse the cached prefix and only process the suffix.
     /// </summary>
+    /// <param name="query">The string to match against.</param>
+    /// <param name="key">When this method returns <c>true</c>, the longest stored
+    /// key that is a prefix of <paramref name="query"/>; otherwise <c>null</c>.</param>
+    /// <param name="value">When this method returns <c>true</c>, the value
+    /// associated with <paramref name="key"/>; otherwise the default value of
+    /// <typeparamref name="TValue"/>.</param>
+    /// <returns><c>true</c> if any stored key is a prefix of
+    /// <paramref name="query"/>; otherwise <c>false</c>.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="query"/> is null.</exception>
+    /// <remarks>
+    /// A stored key is considered a prefix of <paramref name="query"/> if the
+    /// query starts with that key. The empty string is not returned as a match
+    /// even if the root were to hold a value, because the root holds no key.
+    /// Runs in O(<paramref name="query"/>.Length) time.
+    /// </remarks>
     public bool TryGetLongestPrefix(string query, out string? key, out TValue? value)
     {
         ArgumentNullException.ThrowIfNull(query);
-        lock (_gate)
+        key = null;
+        value = default;
+
+        Node node = _root;
+        int pos = 0;
+        int bestEnd = -1;       // end position in `query` of the longest match so far
+        Node? bestNode = null;  // node holding the value for that match
+
+        while (pos <= query.Length)
         {
-            DateTime now = _clock();
-            while (true)
+            // Record a candidate match whenever the current node holds a value.
+            // The root (pos == 0) is skipped: it holds no key of its own.
+            if (pos > 0 && node.HasValue)
             {
-                if (!_trie.TryGetLongestPrefix(query, out key, out value))
-                {
-                    key = null;
-                    value = default;
-                    return false;
-                }
-
-                if (_entries.TryGetValue(key!, out CacheEntry? entry) && IsExpired(entry, now))
-                {
-                    RemoveEntry(key!);
-                    continue; // try the next-longest non-expired prefix
-                }
-
-                if (entry is not null) entry.LastAccess = now;
-                return true;
+                bestEnd = pos;
+                bestNode = node;
             }
-        }
-    }
 
-    /// <summary>
-    /// Returns a snapshot of all entries whose key starts with
-    /// <paramref name="prefix"/>, with their values. The snapshot is materialized
-    /// under the lock, so callers can enumerate it safely even if the cache is
-    /// mutated concurrently afterwards. Expired entries are removed and excluded.
-    /// </summary>
-    /// <exception cref="ArgumentNullException"><paramref name="prefix"/> is null.</exception>
-    public IReadOnlyList<KeyValuePair<string, TValue?>> SearchByPrefix(string prefix)
-    {
-        ArgumentNullException.ThrowIfNull(prefix);
-        lock (_gate)
-        {
-            DateTime now = _clock();
-            var results = new List<KeyValuePair<string, TValue?>>();
-            var expired = new List<string>();
-            foreach (KeyValuePair<string, TValue?> kvp in _trie.SearchByPrefix(prefix))
-            {
-                if (_entries.TryGetValue(kvp.Key, out CacheEntry? entry) && IsExpired(entry, now))
-                {
-                    // Defer removal until after enumeration: mutating the trie
-                    // (via RemoveEntry -> _trie.Delete) while lazily enumerating
-                    // _trie.SearchByPrefix would corrupt the enumeration.
-                    expired.Add(kvp.Key);
-                }
-                else
-                {
-                    results.Add(kvp);
-                }
-            }
-            foreach (string key in expired)
-            {
-                RemoveEntry(key);
-            }
-            return results;
-        }
-    }
+            // Stop if we've consumed the entire query.
+            if (pos == query.Length) break;
 
-    /// <summary>
-    /// Removes <paramref name="key"/> and its value. Returns <c>true</c> if the
-    /// key was present.
-    /// </summary>
-    /// <exception cref="ArgumentNullException"><paramref name="key"/> is null.</exception>
-    public bool Delete(string key)
-    {
-        ArgumentNullException.ThrowIfNull(key);
-        lock (_gate)
-        {
-            bool removed = _trie.Delete(key);
-            _entries.Remove(key);
-            return removed;
-        }
-    }
+            if (!node.Children.TryGetValue(query[pos], out Node? child)) break;
 
-    /// <summary>
-    /// Removes all entries from the cache.
-    /// </summary>
-    public void Clear()
-    {
-        lock (_gate)
-        {
-            // Swap in a fresh trie: O(1) and atomic under the lock.
-            _trie = new RadixTrie<TValue>();
-            _entries.Clear();
-        }
-    }
+            ReadOnlySpan<char> edge = child.EdgeLabel.AsSpan();
+            ReadOnlySpan<char> remaining = query.AsSpan(pos);
+            int i = CommonPrefixLength(edge, remaining);
 
-    /// <summary>
-    /// Removes all expired entries and returns the number removed. Useful for a
-    /// background sweep.
-    /// </summary>
-    public int TrimExpired()
-    {
-        lock (_gate)
-        {
-            DateTime now = _clock();
-            int removed = 0;
-            foreach (string key in new List<string>(_entries.Keys))
-            {
-                if (_entries.TryGetValue(key, out CacheEntry? entry) && IsExpired(entry, now))
-                {
-                    RemoveEntry(key);
-                    removed++;
-                }
-            }
-            return removed;
-        }
-    }
+            // Query diverges from the edge before the edge ends: no deeper match.
+            if (i < edge.Length) break;
 
-    /// <summary>
-    /// Returns the cached value for <paramref name="key"/> if present and not
-    /// expired; otherwise invokes <paramref name="factory"/> to produce it and
-    /// stores the result. The factory runs outside the lock, so concurrent
-    /// callers may compute the same key more than once (the last writer wins).
-    /// </summary>
-    /// <exception cref="ArgumentNullException"><paramref name="key"/> or
-    /// <paramref name="factory"/> is null.</exception>
-    public TValue? GetOrAdd(string key, Func<string, TValue?> factory)
-    {
-        ArgumentNullException.ThrowIfNull(key);
-        ArgumentNullException.ThrowIfNull(factory);
-
-        lock (_gate)
-        {
-            if (TryGetInternal(key, out TValue? existing)) return existing;
+            // Edge fully matched: descend and keep consuming the query.
+            node = child;
+            pos += i;
         }
 
-        TValue? value = factory(key);
+        if (bestNode is null || bestEnd < 0) return false;
 
-        lock (_gate)
-        {
-            if (TryGetInternal(key, out TValue? existing)) return existing;
-            Insert(key, value);
-            return value;
-        }
-    }
-
-    /// <summary>
-    /// Asynchronously returns the cached value for <paramref name="key"/> if
-    /// present and not expired; otherwise awaits <paramref name="factory"/> to
-    /// produce it and stores the result. The factory is awaited <b>outside</b>
-    /// the lock, so a slow fetch never blocks other callers (check-then-act).
-    /// </summary>
-    /// <exception cref="ArgumentNullException"><paramref name="key"/> or
-    /// <paramref name="factory"/> is null.</exception>
-    public async ValueTask<TValue?> GetOrAddAsync(
-        string key,
-        Func<string, CancellationToken, ValueTask<TValue?>> factory,
-        CancellationToken cancellationToken = default)
-    {
-        ArgumentNullException.ThrowIfNull(key);
-        ArgumentNullException.ThrowIfNull(factory);
-
-        lock (_gate)
-        {
-            if (TryGetInternal(key, out TValue? existing)) return existing;
-        }
-
-        TValue? value = await factory(key, cancellationToken).ConfigureAwait(false);
-
-        lock (_gate)
-        {
-            if (TryGetInternal(key, out TValue? existing)) return existing;
-            Insert(key, value);
-            return value;
-        }
-    }
-
-    // ------------------------------------------------------------- internals
-
-    private bool TryGetInternal(string key, out TValue? value)
-    {
-        DateTime now = _clock();
-        if (!_entries.TryGetValue(key, out CacheEntry? entry))
-        {
-            value = default;
-            return false;
-        }
-        if (IsExpired(entry, now))
-        {
-            RemoveEntry(key);
-            value = default;
-            return false;
-        }
-        if (!_trie.TryGet(key, out value))
-        {
-            value = default;
-            return false;
-        }
-        entry.LastAccess = now;
+        key = query.Substring(0, bestEnd);
+        value = bestNode.Value;
         return true;
     }
 
-    private static bool IsExpired(CacheEntry entry, DateTime now)
-        => entry.ExpiresAt.HasValue && now >= entry.ExpiresAt.Value;
-
-    private void RemoveEntry(string key)
+    /// <summary>
+    /// Lazily yields all keys starting with the given prefix, along with their
+    /// associated values. The matching subtree is walked on demand as the
+    /// caller enumerates, so only the visited portion is held in memory at any
+    /// time.
+    /// </summary>
+    /// <exception cref="ArgumentNullException"><paramref name="prefix"/> is null.</exception>
+    public IEnumerable<KeyValuePair<string, TValue?>> SearchByPrefix(string prefix)
     {
-        _trie.Delete(key);
-        _entries.Remove(key);
-    }
+        ArgumentNullException.ThrowIfNull(prefix);
 
-    private void EvictIfNeeded(DateTime now)
-    {
-        while (_entries.Count > _capacity)
+        // Phase 1: iteratively locate the subtree that roots the matches.
+        Node node = _root;
+        int pos = 0;
+        string accumulated = string.Empty;
+        while (pos < prefix.Length)
         {
-            string? lruKey = null;
-            DateTime lruTime = DateTime.MaxValue;
-            foreach (KeyValuePair<string, CacheEntry> kvp in _entries)
+            if (!node.Children.TryGetValue(prefix[pos], out Node? child)) yield break;
+
+            ReadOnlySpan<char> edge = child.EdgeLabel.AsSpan();
+            ReadOnlySpan<char> remaining = prefix.AsSpan(pos);
+            int i = CommonPrefixLength(edge, remaining);
+
+            // Diverged before either the edge or the prefix was consumed: no matches.
+            if (i < edge.Length && i < remaining.Length) yield break;
+
+            accumulated += child.EdgeLabel;
+            node = child;
+
+            if (i == remaining.Length)
             {
-                if (kvp.Value.LastAccess < lruTime)
-                {
-                    lruTime = kvp.Value.LastAccess;
-                    lruKey = kvp.Key;
-                }
+                // Prefix fully consumed (either exactly at the edge end or
+                // partway through this edge). The whole subtree under `child`
+                // matches.
+                break;
             }
-            if (lruKey is null) break;
-            RemoveEntry(lruKey);
+
+            // Edge fully matched but prefix continues: descend.
+            pos += i;
+        }
+
+        // Phase 2: iterative DFS with an explicit stack (avoids deep
+        // iterator nesting / recursion for large subtrees).
+        var stack = new Stack<(Node node, string path)>();
+        stack.Push((node, accumulated));
+        while (stack.Count > 0)
+        {
+            var (current, path) = stack.Pop();
+            if (current.HasValue)
+            {
+                yield return new KeyValuePair<string, TValue?>(path, current.Value);
+            }
+
+            // Push children in reverse order so they are visited in their
+            // original insertion order (left-to-right).
+            var children = new List<Node>(current.Children.Values);
+            for (int i = children.Count - 1; i >= 0; i--)
+            {
+                Node c = children[i];
+                stack.Push((c, path + c.EdgeLabel));
+            }
         }
     }
+
+    /// <summary>
+    /// Returns the length of the longest common prefix of two spans.
+    /// </summary>
+    private static int CommonPrefixLength(ReadOnlySpan<char> a, ReadOnlySpan<char> b)
+    {
+        int n = a.Length < b.Length ? a.Length : b.Length;
+        int i = 0;
+        while (i < n && a[i] == b[i]) i++;
+        return i;
+    }
 }
+
+/// <summary>
+/// A non-generic radix trie that stores keys with no associated value, useful
+/// when only presence/absence matters (set membership).
+/// </summary>
+public class RadixTrie : RadixTrie<object?>
+{
+    /// <summary>
+    /// Inserts a key into the trie as a presence marker (no value).
+    /// </summary>
+    /// <exception cref="ArgumentNullException"><paramref name="key"/> is null.</exception>
+    public void Insert(string key) => Insert(key, null);
+}
+
 
     
     
