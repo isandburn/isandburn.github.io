@@ -1,3 +1,5 @@
-# theme: jekyll-theme-minimal
-# title: Octocat's homepage
-# description: Bookmark this to keep an eye on my project updates!
+# Site settings
+title: isandburn.github.io
+description: A simple static page with a copyable code block.
+
+# No remote theme is applied, so our custom index.html is served as-is.
