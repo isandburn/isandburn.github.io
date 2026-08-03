@@ -1,0 +1,421 @@
+//RadixTrie.cs
+using System;
+using System.Collections.Generic;
+
+namespace isandburn.collections;
+
+/// <summary>
+/// A compact prefix tree (radix trie) mapping string keys to optional values,
+/// keyed by their shared prefixes.
+/// </summary>
+/// <typeparam name="TValue">The type of value associated with each stored key.</typeparam>
+/// <remarks>
+/// This implementation is <b>not thread-safe</b>. Concurrent calls to
+/// <see cref="Insert"/>, <see cref="Delete"/>, or even overlapping
+/// <see cref="SearchByPrefix"/> enumerations against a shared instance may
+/// corrupt the internal dictionaries. Callers that need concurrent access
+/// must synchronize externally (e.g. with a lock).
+/// </remarks>
+public class RadixTrie<TValue>
+{
+    private class Node
+    {
+        public string EdgeLabel { get; set; }
+        public Dictionary<char, Node> Children { get; } = new Dictionary<char, Node>();
+        // A node "has a value" when it marks the end of a stored key. The value
+        // may be null even for a present key (e.g. TValue is a reference type
+        // and the caller stored null), so presence is tracked separately from
+        // the value itself via HasValue.
+        public TValue? Value { get; set; }
+        public bool HasValue { get; set; }
+
+        public Node(string edgeLabel)
+        {
+            EdgeLabel = edgeLabel;
+        }
+    }
+
+    private readonly Node _root = new Node(string.Empty);
+
+    /// <summary>
+    /// Gets the number of keys currently stored in the trie.
+    /// </summary>
+    public int Count { get; private set; }
+
+    /// <summary>
+    /// Inserts or updates the value associated with <paramref name="key"/>.
+    /// If the key already exists, its value is replaced.
+    /// </summary>
+    /// <exception cref="ArgumentNullException"><paramref name="key"/> is null.</exception>
+    public void Insert(string key, TValue? value)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        if (key.Length == 0) return;
+
+        Node node = _root;
+        int pos = 0;
+        while (true)
+        {
+            // Consumed the entire key exactly at this node boundary.
+            if (pos == key.Length)
+            {
+                if (!node.HasValue) Count++;
+                node.Value = value;
+                node.HasValue = true;
+                return;
+            }
+
+            char c = key[pos];
+            if (!node.Children.TryGetValue(c, out Node? child))
+            {
+                // No matching edge: create a fresh leaf holding the rest of the key.
+                var leaf = new Node(key.Substring(pos))
+                {
+                    Value = value,
+                    HasValue = true
+                };
+                node.Children.Add(c, leaf);
+                Count++;
+                return;
+            }
+
+            ReadOnlySpan<char> edge = child.EdgeLabel.AsSpan();
+            ReadOnlySpan<char> remaining = key.AsSpan(pos);
+            int i = CommonPrefixLength(edge, remaining);
+
+            if (i == edge.Length)
+            {
+                // Edge fully matched: descend and keep consuming the key.
+                node = child;
+                pos += i;
+            }
+            else
+            {
+                // Edge mismatch mid-label: split the existing edge.
+                string commonPrefix = child.EdgeLabel.Substring(0, i);
+                string remainingEdge = child.EdgeLabel.Substring(i);
+                int remainingKeyLen = key.Length - pos - i;
+
+                child.EdgeLabel = commonPrefix;
+
+                // Move the old node's value flag and children into a new split
+                // node keyed by the first character of the remaining edge.
+                Node splitNode = new Node(remainingEdge)
+                {
+                    Value = child.Value,
+                    HasValue = child.HasValue
+                };
+                foreach (var grandChild in child.Children)
+                {
+                    splitNode.Children.Add(grandChild.Key, grandChild.Value);
+                }
+
+                child.Children.Clear();
+                child.Children.Add(remainingEdge[0], splitNode);
+
+                // The old node's value/HasValue have been moved to splitNode;
+                // reset child so it represents only the split-point key (if
+                // any) going forward. Without this, the HasValue flag below
+                // would still reflect the old key and the new key's Count
+                // increment would be skipped.
+                child.Value = default;
+                child.HasValue = false;
+
+                if (remainingKeyLen == 0)
+                {
+                    // The new key ends exactly at the split point. It is always
+                    // new here: if it already existed, the edge would already
+                    // be split at this boundary and we would have descended and
+                    // updated in place rather than splitting.
+                    child.Value = value;
+                    child.HasValue = true;
+                    Count++;
+                }
+                else
+                {
+                    // Append the rest of the new key as a new leaf.
+                    string remainingKey = key.Substring(pos + i);
+                    var leaf = new Node(remainingKey)
+                    {
+                        Value = value,
+                        HasValue = true
+                    };
+                    child.Children.Add(remainingKey[0], leaf);
+                    Count++;
+                }
+                return;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Removes a key and its associated value from the trie, compacting edges
+    /// back together where possible.
+    /// </summary>
+    /// <returns><c>true</c> if the key was present and removed; otherwise <c>false</c>.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="key"/> is null.</exception>
+    public bool Delete(string key)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        if (key.Length == 0) return false;
+
+        // Walk down recording the path so we can unwind and compact iteratively.
+        var path = new List<(Node parent, char key, Node child)>();
+        Node node = _root;
+        int pos = 0;
+        while (pos < key.Length)
+        {
+            char c = key[pos];
+            if (!node.Children.TryGetValue(c, out Node? child)) return false;
+
+            ReadOnlySpan<char> edge = child.EdgeLabel.AsSpan();
+            ReadOnlySpan<char> remaining = key.AsSpan(pos);
+            int i = CommonPrefixLength(edge, remaining);
+
+            // Key diverges from the edge before the edge ends -> not present.
+            if (i < edge.Length) return false;
+
+            path.Add((node, c, child));
+            node = child;
+            pos += i;
+        }
+
+        if (!node.HasValue) return false;
+        node.Value = default;
+        node.HasValue = false;
+        Count--;
+
+        // Unwind from the leaf upward, pruning dead leaves and merging
+        // single-child chains to keep the trie compact.
+        for (int idx = path.Count - 1; idx >= 0; idx--)
+        {
+            var (parent, keyChar, child) = path[idx];
+
+            if (child.Children.Count == 0 && !child.HasValue)
+            {
+                // Child is now an empty leaf: remove it from its parent.
+                parent.Children.Remove(keyChar);
+            }
+            else if (!child.HasValue && child.Children.Count == 1)
+            {
+                // Child is a pass-through node with a single descendant: merge.
+                Node grandChild = GetSingleChild(child);
+                child.EdgeLabel = child.EdgeLabel + grandChild.EdgeLabel;
+                child.Value = grandChild.Value;
+                child.HasValue = grandChild.HasValue;
+                child.Children.Clear();
+                foreach (var gc in grandChild.Children)
+                {
+                    child.Children.Add(gc.Key, gc.Value);
+                }
+            }
+        }
+        return true;
+    }
+
+    private static Node GetSingleChild(Node node)
+    {
+        foreach (var entry in node.Children)
+        {
+            return entry.Value;
+        }
+        throw new InvalidOperationException("Expected exactly one child.");
+    }
+
+    /// <summary>
+    /// Returns <c>true</c> if the exact key is present in the trie, and outputs
+    /// its associated value.
+    /// </summary>
+    /// <exception cref="ArgumentNullException"><paramref name="key"/> is null.</exception>
+    public bool TryGet(string key, out TValue? value)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        value = default;
+
+        Node node = _root;
+        int pos = 0;
+        while (true)
+        {
+            if (pos == key.Length)
+            {
+                if (!node.HasValue) return false;
+                value = node.Value;
+                return true;
+            }
+
+            if (!node.Children.TryGetValue(key[pos], out Node? child)) return false;
+
+            ReadOnlySpan<char> edge = child.EdgeLabel.AsSpan();
+            ReadOnlySpan<char> remaining = key.AsSpan(pos);
+            int i = CommonPrefixLength(edge, remaining);
+
+            // Key diverges from the edge before the edge ends -> not present.
+            if (i < edge.Length) return false;
+
+            // Edge fully matched: descend and keep consuming.
+            node = child;
+            pos += i;
+        }
+    }
+
+    /// <summary>
+    /// Returns <c>true</c> if the exact key is present in the trie.
+    /// </summary>
+    /// <exception cref="ArgumentNullException"><paramref name="key"/> is null.</exception>
+    public bool Contains(string key) => TryGet(key, out _);
+
+    /// <summary>
+    /// Finds the longest stored key that is a prefix of <paramref name="query"/>
+    /// and returns it along with its associated value. This is the structural
+    /// query a prefix cache is built around: given a query string, find the
+    /// longest already-stored entry that the query extends, so the caller can
+    /// reuse the cached prefix and only process the suffix.
+    /// </summary>
+    /// <param name="query">The string to match against.</param>
+    /// <param name="key">When this method returns <c>true</c>, the longest stored
+    /// key that is a prefix of <paramref name="query"/>; otherwise <c>null</c>.</param>
+    /// <param name="value">When this method returns <c>true</c>, the value
+    /// associated with <paramref name="key"/>; otherwise the default value of
+    /// <typeparamref name="TValue"/>.</param>
+    /// <returns><c>true</c> if any stored key is a prefix of
+    /// <paramref name="query"/>; otherwise <c>false</c>.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="query"/> is null.</exception>
+    /// <remarks>
+    /// A stored key is considered a prefix of <paramref name="query"/> if the
+    /// query starts with that key. The empty string is not returned as a match
+    /// even if the root were to hold a value, because the root holds no key.
+    /// Runs in O(<paramref name="query"/>.Length) time.
+    /// </remarks>
+    public bool TryGetLongestPrefix(string query, out string? key, out TValue? value)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        key = null;
+        value = default;
+
+        Node node = _root;
+        int pos = 0;
+        int bestEnd = -1;       // end position in `query` of the longest match so far
+        Node? bestNode = null;  // node holding the value for that match
+
+        while (pos <= query.Length)
+        {
+            // Record a candidate match whenever the current node holds a value.
+            // The root (pos == 0) is skipped: it holds no key of its own.
+            if (pos > 0 && node.HasValue)
+            {
+                bestEnd = pos;
+                bestNode = node;
+            }
+
+            // Stop if we've consumed the entire query.
+            if (pos == query.Length) break;
+
+            if (!node.Children.TryGetValue(query[pos], out Node? child)) break;
+
+            ReadOnlySpan<char> edge = child.EdgeLabel.AsSpan();
+            ReadOnlySpan<char> remaining = query.AsSpan(pos);
+            int i = CommonPrefixLength(edge, remaining);
+
+            // Query diverges from the edge before the edge ends: no deeper match.
+            if (i < edge.Length) break;
+
+            // Edge fully matched: descend and keep consuming the query.
+            node = child;
+            pos += i;
+        }
+
+        if (bestNode is null || bestEnd < 0) return false;
+
+        key = query.Substring(0, bestEnd);
+        value = bestNode.Value;
+        return true;
+    }
+
+    /// <summary>
+    /// Lazily yields all keys starting with the given prefix, along with their
+    /// associated values. The matching subtree is walked on demand as the
+    /// caller enumerates, so only the visited portion is held in memory at any
+    /// time.
+    /// </summary>
+    /// <exception cref="ArgumentNullException"><paramref name="prefix"/> is null.</exception>
+    public IEnumerable<KeyValuePair<string, TValue?>> SearchByPrefix(string prefix)
+    {
+        ArgumentNullException.ThrowIfNull(prefix);
+
+        // Phase 1: iteratively locate the subtree that roots the matches.
+        Node node = _root;
+        int pos = 0;
+        string accumulated = string.Empty;
+        while (pos < prefix.Length)
+        {
+            if (!node.Children.TryGetValue(prefix[pos], out Node? child)) yield break;
+
+            ReadOnlySpan<char> edge = child.EdgeLabel.AsSpan();
+            ReadOnlySpan<char> remaining = prefix.AsSpan(pos);
+            int i = CommonPrefixLength(edge, remaining);
+
+            // Diverged before either the edge or the prefix was consumed: no matches.
+            if (i < edge.Length && i < remaining.Length) yield break;
+
+            accumulated += child.EdgeLabel;
+            node = child;
+
+            if (i == remaining.Length)
+            {
+                // Prefix fully consumed (either exactly at the edge end or
+                // partway through this edge). The whole subtree under `child`
+                // matches.
+                break;
+            }
+
+            // Edge fully matched but prefix continues: descend.
+            pos += i;
+        }
+
+        // Phase 2: iterative DFS with an explicit stack (avoids deep
+        // iterator nesting / recursion for large subtrees).
+        var stack = new Stack<(Node node, string path)>();
+        stack.Push((node, accumulated));
+        while (stack.Count > 0)
+        {
+            var (current, path) = stack.Pop();
+            if (current.HasValue)
+            {
+                yield return new KeyValuePair<string, TValue?>(path, current.Value);
+            }
+
+            // Push children in reverse order so they are visited in their
+            // original insertion order (left-to-right).
+            var children = new List<Node>(current.Children.Values);
+            for (int i = children.Count - 1; i >= 0; i--)
+            {
+                Node c = children[i];
+                stack.Push((c, path + c.EdgeLabel));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Returns the length of the longest common prefix of two spans.
+    /// </summary>
+    private static int CommonPrefixLength(ReadOnlySpan<char> a, ReadOnlySpan<char> b)
+    {
+        int n = a.Length < b.Length ? a.Length : b.Length;
+        int i = 0;
+        while (i < n && a[i] == b[i]) i++;
+        return i;
+    }
+}
+
+/// <summary>
+/// A non-generic radix trie that stores keys with no associated value, useful
+/// when only presence/absence matters (set membership).
+/// </summary>
+public class RadixTrie : RadixTrie<object?>
+{
+    /// <summary>
+    /// Inserts a key into the trie as a presence marker (no value).
+    /// </summary>
+    /// <exception cref="ArgumentNullException"><paramref name="key"/> is null.</exception>
+    public void Insert(string key) => Insert(key, null);
+}
