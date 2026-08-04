@@ -1,373 +1,46 @@
-//RadixCache.cs
-using System;
-using System.Collections.Generic;
-using System.Threading;
-using System.Threading.Tasks;
+//OpenAI-chat-compatible request optimization strategy
+========================================================================================
+                                1. THE STATIC CANOPY (Root Stem)
+   [Cached across all users, all sessions, and all tasks on the host instance]
+========================================================================================
+[System Role]
+│
+├── A. Global Model Behavioral Rules & Formatting Preferences
+│    └── "You are an expert coding assistant..."
+│
+├── B. User/Project Custom Instructions
+│    └── (Contents of .github/copilot-instructions.md, sorted deterministically)
+│
+└── C. Tier 1 Skill Catalog (Names + Descriptions ONLY)
+     └── <available_skills>
+           <skill><name>git-workflow</name><desc>...</desc></skill>
+           <skill><name>pdf-processing</name><desc>...</desc></skill>
+         </available_skills>
 
-namespace isandburn.collections;
+========================================================================================
+                               2. THE SESSION TRUNK (Intermediate Branch)
+   [Cached across consecutive turns within the same workspace/task epoch]
+========================================================================================
+[User / Assistant Message History]
+│
+├── D. Environment & Project Architecture Index
+│    └── Working Dir, Git Branch, Primary Language AST Maps
+│
+├── E. Turn 1: Initial User Goal & Agent Planning
+│    └── User: "Extract tables from invoice.pdf"
+│    └── Assistant Tool Call: activate_skill("pdf-processing")
+│
+└── F. Tier 2 Progressive Disclosure (SKILL.md Appended)
+     └── Tool Result: "<skill_content name='pdf-processing'> # PDF Parsing Rules... </skill_content>"
+         *** [RADIX LOCK POINT: This SKILL.md body is now warm KV cache for Turn 2+] ***
 
-/// <summary>
-/// A thread-safe, size-bounded prefix cache built on top of
-/// <see cref="RadixTrie{TValue}"/>. Combines the trie's O(L) prefix queries
-/// with the policy a cache manager needs: LRU + size-based eviction, optional
-/// TTL, snapshot enumeration, and a check-then-act async fetch path.
-/// </summary>
-/// <typeparam name="TValue">The type of value associated with each cached key.</typeparam>
-/// <remarks>
-/// <para>
-/// <b>Thread safety.</b> All public operations are guarded by a single private
-/// lock, so concurrent callers (e.g. a UI thread plus background fetch/refresh
-/// work) are safe. The lock is never held across an <c>await</c>: the slow
-/// cache-miss fetch runs outside the lock (see <see cref="GetOrAddAsync"/>),
-/// so a fetch never blocks other callers.
-/// </para>
-/// <para>
-/// <b>Eviction.</b> When the cache exceeds <see cref="Capacity"/>, the
-/// least-recently-used entry is evicted. Entries with a TTL are also removed
-/// lazily on access and by <see cref="TrimExpired"/>.
-/// </para>
-/// <para>
-/// <b>Empty keys.</b> Consistent with the underlying trie, inserting an empty
-/// string key is a no-op and is never stored.
-/// </para>
-/// </remarks>
-public class RadixCache<TValue>
-{
-    private sealed class CacheEntry
-    {
-        public DateTime LastAccess;
-        public DateTime? ExpiresAt;
-    }
-
-    private readonly object _gate = new();
-    private RadixTrie<TValue> _trie = new();
-    private readonly Dictionary<string, CacheEntry> _entries = new();
-    private readonly int _capacity;
-    private readonly TimeSpan? _defaultTtl;
-    private readonly Func<DateTime> _clock;
-
-    /// <summary>
-    /// Gets the maximum number of entries the cache will hold before evicting
-    /// the least-recently-used entry.
-    /// </summary>
-    public int Capacity => _capacity;
-
-    /// <summary>
-    /// Gets the number of entries currently stored in the cache.
-    /// </summary>
-    public int Count
-    {
-        get
-        {
-            lock (_gate)
-            {
-                return _entries.Count;
-            }
-        }
-    }
-
-    /// <summary>
-    /// Initializes a new cache with the given capacity and optional default TTL.
-    /// </summary>
-    /// <param name="capacity">The maximum number of entries. Must be &gt; 0.</param>
-    /// <param name="defaultTtl">Optional default time-to-live applied to entries
-    /// inserted without an explicit TTL. <c>null</c> means no expiry.</param>
-    /// <param name="clock">Optional clock source (for testing). Defaults to
-    /// <see cref="DateTime.UtcNow"/>.</param>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="capacity"/> is &lt;= 0.</exception>
-    public RadixCache(int capacity, TimeSpan? defaultTtl = null, Func<DateTime>? clock = null)
-    {
-        if (capacity <= 0) throw new ArgumentOutOfRangeException(nameof(capacity), "Capacity must be greater than zero.");
-        _capacity = capacity;
-        _defaultTtl = defaultTtl;
-        _clock = clock ?? (() => DateTime.UtcNow);
-    }
-
-    /// <summary>
-    /// Inserts or updates the value for <paramref name="key"/>, using the
-    /// cache's default TTL. If the cache is at capacity, the least-recently-used
-    /// entry is evicted.
-    /// </summary>
-    /// <exception cref="ArgumentNullException"><paramref name="key"/> is null.</exception>
-    public void Insert(string key, TValue? value) => Insert(key, value, _defaultTtl);
-
-    /// <summary>
-    /// Inserts or updates the value for <paramref name="key"/> with an explicit
-    /// TTL. If the cache is at capacity, the least-recently-used entry is evicted.
-    /// </summary>
-    /// <exception cref="ArgumentNullException"><paramref name="key"/> is null.</exception>
-    public void Insert(string key, TValue? value, TimeSpan? ttl)
-    {
-        ArgumentNullException.ThrowIfNull(key);
-        if (key.Length == 0) return; // consistent with the trie: empty key is a no-op
-
-        lock (_gate)
-        {
-            DateTime now = _clock();
-            bool isNew = !_entries.ContainsKey(key);
-
-            _trie.Insert(key, value);
-            _entries[key] = new CacheEntry
-            {
-                LastAccess = now,
-                ExpiresAt = ttl.HasValue ? now + ttl.Value : null
-            };
-
-            if (isNew) EvictIfNeeded(now);
-        }
-    }
-
-    /// <summary>
-    /// Attempts to retrieve the value for <paramref name="key"/>. On a hit, the
-    /// entry's last-access time is updated (for LRU). Expired entries are
-    /// removed and treated as misses.
-    /// </summary>
-    /// <exception cref="ArgumentNullException"><paramref name="key"/> is null.</exception>
-    public bool TryGet(string key, out TValue? value)
-    {
-        ArgumentNullException.ThrowIfNull(key);
-        lock (_gate)
-        {
-            return TryGetInternal(key, out value);
-        }
-    }
-
-    /// <summary>
-    /// Returns <c>true</c> if <paramref name="key"/> is present and not expired.
-    /// </summary>
-    /// <exception cref="ArgumentNullException"><paramref name="key"/> is null.</exception>
-    public bool Contains(string key) => TryGet(key, out _);
-
-    /// <summary>
-    /// Finds the longest stored key that is a prefix of <paramref name="query"/>
-    /// and returns it with its value. Expired matches are removed and skipped in
-    /// favor of the next-longest non-expired prefix.
-    /// </summary>
-    /// <exception cref="ArgumentNullException"><paramref name="query"/> is null.</exception>
-    public bool TryGetLongestPrefix(string query, out string? key, out TValue? value)
-    {
-        ArgumentNullException.ThrowIfNull(query);
-        lock (_gate)
-        {
-            DateTime now = _clock();
-            while (true)
-            {
-                if (!_trie.TryGetLongestPrefix(query, out key, out value))
-                {
-                    key = null;
-                    value = default;
-                    return false;
-                }
-
-                if (_entries.TryGetValue(key!, out CacheEntry? entry) && IsExpired(entry, now))
-                {
-                    RemoveEntry(key!);
-                    continue; // try the next-longest non-expired prefix
-                }
-
-                if (entry is not null) entry.LastAccess = now;
-                return true;
-            }
-        }
-    }
-
-    /// <summary>
-    /// Returns a snapshot of all entries whose key starts with
-    /// <paramref name="prefix"/>, with their values. The snapshot is materialized
-    /// under the lock, so callers can enumerate it safely even if the cache is
-    /// mutated concurrently afterwards. Expired entries are removed and excluded.
-    /// </summary>
-    /// <exception cref="ArgumentNullException"><paramref name="prefix"/> is null.</exception>
-    public IReadOnlyList<KeyValuePair<string, TValue?>> SearchByPrefix(string prefix)
-    {
-        ArgumentNullException.ThrowIfNull(prefix);
-        lock (_gate)
-        {
-            DateTime now = _clock();
-            var results = new List<KeyValuePair<string, TValue?>>();
-            var expired = new List<string>();
-            foreach (KeyValuePair<string, TValue?> kvp in _trie.SearchByPrefix(prefix))
-            {
-                if (_entries.TryGetValue(kvp.Key, out CacheEntry? entry) && IsExpired(entry, now))
-                {
-                    // Defer removal until after enumeration: mutating the trie
-                    // (via RemoveEntry -> _trie.Delete) while lazily enumerating
-                    // _trie.SearchByPrefix would corrupt the enumeration.
-                    expired.Add(kvp.Key);
-                }
-                else
-                {
-                    results.Add(kvp);
-                }
-            }
-            foreach (string key in expired)
-            {
-                RemoveEntry(key);
-            }
-            return results;
-        }
-    }
-
-    /// <summary>
-    /// Removes <paramref name="key"/> and its value. Returns <c>true</c> if the
-    /// key was present.
-    /// </summary>
-    /// <exception cref="ArgumentNullException"><paramref name="key"/> is null.</exception>
-    public bool Delete(string key)
-    {
-        ArgumentNullException.ThrowIfNull(key);
-        lock (_gate)
-        {
-            bool removed = _trie.Delete(key);
-            _entries.Remove(key);
-            return removed;
-        }
-    }
-
-    /// <summary>
-    /// Removes all entries from the cache.
-    /// </summary>
-    public void Clear()
-    {
-        lock (_gate)
-        {
-            // Swap in a fresh trie: O(1) and atomic under the lock.
-            _trie = new RadixTrie<TValue>();
-            _entries.Clear();
-        }
-    }
-
-    /// <summary>
-    /// Removes all expired entries and returns the number removed. Useful for a
-    /// background sweep.
-    /// </summary>
-    public int TrimExpired()
-    {
-        lock (_gate)
-        {
-            DateTime now = _clock();
-            int removed = 0;
-            foreach (string key in new List<string>(_entries.Keys))
-            {
-                if (_entries.TryGetValue(key, out CacheEntry? entry) && IsExpired(entry, now))
-                {
-                    RemoveEntry(key);
-                    removed++;
-                }
-            }
-            return removed;
-        }
-    }
-
-    /// <summary>
-    /// Returns the cached value for <paramref name="key"/> if present and not
-    /// expired; otherwise invokes <paramref name="factory"/> to produce it and
-    /// stores the result. The factory runs outside the lock, so concurrent
-    /// callers may compute the same key more than once (the last writer wins).
-    /// </summary>
-    /// <exception cref="ArgumentNullException"><paramref name="key"/> or
-    /// <paramref name="factory"/> is null.</exception>
-    public TValue? GetOrAdd(string key, Func<string, TValue?> factory)
-    {
-        ArgumentNullException.ThrowIfNull(key);
-        ArgumentNullException.ThrowIfNull(factory);
-
-        lock (_gate)
-        {
-            if (TryGetInternal(key, out TValue? existing)) return existing;
-        }
-
-        TValue? value = factory(key);
-
-        lock (_gate)
-        {
-            if (TryGetInternal(key, out TValue? existing)) return existing;
-            Insert(key, value);
-            return value;
-        }
-    }
-
-    /// <summary>
-    /// Asynchronously returns the cached value for <paramref name="key"/> if
-    /// present and not expired; otherwise awaits <paramref name="factory"/> to
-    /// produce it and stores the result. The factory is awaited <b>outside</b>
-    /// the lock, so a slow fetch never blocks other callers (check-then-act).
-    /// </summary>
-    /// <exception cref="ArgumentNullException"><paramref name="key"/> or
-    /// <paramref name="factory"/> is null.</exception>
-    public async ValueTask<TValue?> GetOrAddAsync(
-        string key,
-        Func<string, CancellationToken, ValueTask<TValue?>> factory,
-        CancellationToken cancellationToken = default)
-    {
-        ArgumentNullException.ThrowIfNull(key);
-        ArgumentNullException.ThrowIfNull(factory);
-
-        lock (_gate)
-        {
-            if (TryGetInternal(key, out TValue? existing)) return existing;
-        }
-
-        TValue? value = await factory(key, cancellationToken).ConfigureAwait(false);
-
-        lock (_gate)
-        {
-            if (TryGetInternal(key, out TValue? existing)) return existing;
-            Insert(key, value);
-            return value;
-        }
-    }
-
-    // ------------------------------------------------------------- internals
-
-    private bool TryGetInternal(string key, out TValue? value)
-    {
-        DateTime now = _clock();
-        if (!_entries.TryGetValue(key, out CacheEntry? entry))
-        {
-            value = default;
-            return false;
-        }
-        if (IsExpired(entry, now))
-        {
-            RemoveEntry(key);
-            value = default;
-            return false;
-        }
-        if (!_trie.TryGet(key, out value))
-        {
-            value = default;
-            return false;
-        }
-        entry.LastAccess = now;
-        return true;
-    }
-
-    private static bool IsExpired(CacheEntry entry, DateTime now)
-        => entry.ExpiresAt.HasValue && now >= entry.ExpiresAt.Value;
-
-    private void RemoveEntry(string key)
-    {
-        _trie.Delete(key);
-        _entries.Remove(key);
-    }
-
-    private void EvictIfNeeded(DateTime now)
-    {
-        while (_entries.Count > _capacity)
-        {
-            string? lruKey = null;
-            DateTime lruTime = DateTime.MaxValue;
-            foreach (KeyValuePair<string, CacheEntry> kvp in _entries)
-            {
-                if (kvp.Value.LastAccess < lruTime)
-                {
-                    lruTime = kvp.Value.LastAccess;
-                    lruKey = kvp.Key;
-                }
-            }
-            if (lruKey is null) break;
-            RemoveEntry(lruKey);
-        }
-    }
-}
+========================================================================================
+                                3. THE DYNAMIC LEAF (Tail Execution)
+   [Transient tokens generated during active execution]
+========================================================================================
+├── G. Turn 2+: Iterative Task Execution
+│    └── Assistant Tool Call: execute_script("scripts/extract.py")
+│    └── Tool Result (Tier 3 Resource): "Stdout: Extracted 12 rows..."
+│
+└── H. Final User Prompt / Current Generation Target
+     └── "Format those 12 rows into Markdown."
