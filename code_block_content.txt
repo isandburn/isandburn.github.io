@@ -1,4 +1,4 @@
-//OpenAI-chat-compatible request optimization strategy
+```
 ========================================================================================
                                 1. THE STATIC CANOPY (Root Stem)
    [Cached across all users, all sessions, and all tasks on the host instance]
@@ -44,3 +44,4 @@
 │
 └── H. Final User Prompt / Current Generation Target
      └── "Format those 12 rows into Markdown."
+     ```
