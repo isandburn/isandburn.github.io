@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>skills — isandburn.github.io</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+        Helvetica, Arial, sans-serif;
+      background: #0d1117;
+      color: #e6edf3;
+      min-height: 100vh;
+      padding: 32px 24px;
+    }
+
+    .wrap {
+      max-width: 860px;
+      margin: 0 auto;
+    }
+
+    .bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 16px;
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      margin-bottom: 16px;
+    }
+
+    .bar-title {
+      font-size: 13px;
+      color: #8b949e;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .bar-link {
+      font-size: 12px;
+      color: #8b949e;
+      text-decoration: none;
+    }
+
+    .bar-link:hover {
+      color: #c9d1d9;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    th, td {
+      padding: 10px 14px;
+      text-align: left;
+      font-size: 13px;
+      border-bottom: 1px solid #21262d;
+      vertical-align: top;
+    }
+
+    thead th {
+      background: #21262d;
+      color: #8b949e;
+      font-size: 12px;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    tbody tr:last-child td {
+      border-bottom: none;
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    a {
+      color: #58a6ff;
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    .desc {
+      color: #8b949e;
+      line-height: 1.5;
+    }
+
+    h2 {
+      font-size: 12px;
+      font-weight: 500;
+      color: #8b949e;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      margin: 28px 0 10px;
+    }
+
+    p {
+      font-size: 13px;
+      color: #8b949e;
+      line-height: 1.6;
+      margin-bottom: 10px;
+    }
+
+    p code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      background: #21262d;
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      padding: 1px 5px;
+      color: #c9d1d9;
+    }
+
+    .code-card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      overflow: hidden;
+      margin-bottom: 12px;
+    }
+
+    .code-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 14px;
+      background: #21262d;
+      border-bottom: 1px solid #30363d;
+    }
+
+    .code-title {
+      font-size: 12px;
+      color: #8b949e;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .copy-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: #21262d;
+      color: #c9d1d9;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+
+    .copy-btn:hover {
+      background: #30363d;
+      border-color: #8b949e;
+    }
+
+    .copy-btn:active {
+      transform: scale(0.97);
+    }
+
+    .copy-btn.copied {
+      background: #1f6feb;
+      border-color: #1f6feb;
+      color: #fff;
+    }
+
+    pre {
+      margin: 0;
+      padding: 14px 16px;
+      overflow-x: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.6;
+      color: #c9d1d9;
+    }
+
+    code {
+      font-family: inherit;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="bar">
+      <span class="bar-title">skills</span>
+      <a class="bar-link" href="/">← home</a>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>skill</th>
+          <th>description</th>
+          <th>version</th>
+          <th>updated</th>
+          <th>download</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="mono"><a href="typesafe-ai.zip">typesafe-ai</a></td>
+          <td class="desc">Typed judgments (noul, choice, score) and probabilities from TypeSafe's System One models (Jev), plus the bundled <span class="mono">jev</span> bash CLI for the HTTP API.</td>
+          <td class="mono">0.1.0</td>
+          <td class="mono">2026-10-05</td>
+          <td class="mono"><a href="typesafe-ai-0.1.0.zip">zip</a> · <a href="typesafe-ai-0.1.0.zip.sha256">sha256</a></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>Install</h2>
+    <p>Each archive contains one top-level folder named after the skill. Unzip it into a skills directory.</p>
+
+    <div class="code-card">
+      <div class="code-header">
+        <span class="code-title">global — ~/.config/opencode/skills</span>
+        <button class="copy-btn" type="button"><span>Copy</span></button>
+      </div>
+      <pre><code>curl -fsSL https://isandburn.github.io/skills/typesafe-ai.zip -o /tmp/typesafe-ai.zip &amp;&amp; unzip -q -d ~/.config/opencode/skills /tmp/typesafe-ai.zip &amp;&amp; rm /tmp/typesafe-ai.zip</code></pre>
+    </div>
+
+    <div class="code-card">
+      <div class="code-header">
+        <span class="code-title">project-local — &lt;repo&gt;/.opencode/skills</span>
+        <button class="copy-btn" type="button"><span>Copy</span></button>
+      </div>
+      <pre><code>curl -fsSL https://isandburn.github.io/skills/typesafe-ai.zip -o /tmp/typesafe-ai.zip &amp;&amp; unzip -q -d &lt;repo&gt;/.opencode/skills /tmp/typesafe-ai.zip &amp;&amp; rm /tmp/typesafe-ai.zip</code></pre>
+    </div>
+
+    <p>The same folder also works in <code>~/.claude/skills</code> or <code>~/.agents/skills</code>, and their project-level equivalents.</p>
+
+    <h2>Verify a download</h2>
+    <div class="code-card">
+      <div class="code-header">
+        <span class="code-title">sha256</span>
+        <button class="copy-btn" type="button"><span>Copy</span></button>
+      </div>
+      <pre><code>cd /tmp &amp;&amp; curl -fsSL https://isandburn.github.io/skills/typesafe-ai-0.1.0.zip -o typesafe-ai-0.1.0.zip &amp;&amp; curl -fsSL https://isandburn.github.io/skills/typesafe-ai-0.1.0.zip.sha256 -o typesafe-ai-0.1.0.zip.sha256 &amp;&amp; sha256sum -c typesafe-ai-0.1.0.zip.sha256</code></pre>
+    </div>
+  </div>
+
+  <script>
+    document.querySelectorAll(".copy-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const code = btn.closest(".code-card").querySelector("pre code");
+        const label = btn.querySelector("span");
+        const prev = label.textContent;
+        try {
+          await navigator.clipboard.writeText(code.textContent);
+        } catch (err) {
+          const range = document.createRange();
+          range.selectNodeContents(code);
+          const selection = window.getSelection();
+          selection.removeAllRanges();
+          selection.addRange(range);
+          document.execCommand("copy");
+          selection.removeAllRanges();
+        }
+        btn.classList.add("copied");
+        label.textContent = "Copied!";
+        setTimeout(() => {
+          btn.classList.remove("copied");
+          label.textContent = prev;
+        }, 2000);
+      });
+    });
+  </script>
+</body>
+</html>
