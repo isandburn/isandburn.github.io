@@ -32,16 +32,23 @@ Everything here is public.
        cp <name>-<version>.zip <name>-<version>.zip.sha256 skills/
        cp <name>-<version>.zip skills/<name>.zip
 
-4. Add or refresh the row in `skills/index.html` (name, description, version,
+4. Add or refresh the agent-facing markdown twins:
+   - `skills.md`: the `## <name>` section with Version, Updated, Archive,
+     Checksum (release facts live here and only here).
+   - `skills/<name>.md`: the card (stable facts only — no version, checksum,
+     or versioned archive; install one-liners use the versionless `<name>.zip`).
+5. Add or refresh the row in `skills/index.html` (name, description, version,
    date, links) and update the install/verify one-liners for the new version if
    they reference one.
-5. Hygiene check before publishing:
+6. Hygiene check before publishing:
 
        unzip -l <name>-<version>.zip
 
    Confirm the single top-level folder and that nothing unexpected is inside.
-6. Commit and push to `main` — GitHub Pages is live within a minute.
-7. Verify the live artifact:
+7. Commit and push to `main` — GitHub Pages is live within a minute. The
+   `llms-check` workflow also lints the agent-facing docs and fails the push
+   review if the markdown twins drift from the published artifacts.
+8. Verify the live artifact:
 
        curl -fsSL https://isandburn.github.io/skills/<name>-<version>.zip | sha256sum
 
