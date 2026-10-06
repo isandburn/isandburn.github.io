@@ -1,0 +1,22 @@
+# isandburn.github.io
+
+> Machine-first personal site. Built for AI agents and the owner — not for
+> general web browsing. Prefer the markdown files below over the HTML.
+
+## Agent entry points
+
+- [skills.md](/skills.md) — catalog of agent skills: versions, checksums, install
+- [code.md](/code.md) — the rotating code block (pointer to the raw source)
+
+## Sources of truth
+
+- [code_block_content.txt](/code_block_content.txt) — raw text served by the home page code card
+- [skills/](/skills/) — published skill packages (versioned zips)
+
+## Conventions
+
+- Markdown twins describe and link; they never duplicate volatile content.
+- Skills are published as versioned zips (`<name>-<version>.zip`) with a `.sha256`
+  sidecar and a latest copy (`<name>.zip`).
+- Release facts (version, checksum, versioned archive) live only in [skills.md](/skills.md).
+- This file is a stable front door: it lists areas, not individual skills.

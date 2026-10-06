@@ -1,0 +1,14 @@
+name: llms-check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  llms-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: lint agent docs
+        run: bash tools/llms-check.sh
